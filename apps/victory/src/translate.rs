@@ -783,3 +783,108 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
+
+/// Pre-translates every unique DXBC shader container found under `paths` into
+/// the runtime on-disk shader cache, using the host GPU's actual wave width and
+/// descriptor heap limit so every entry hits at runtime.
+pub fn prewarm(paths: Vec<PathBuf>, progress: bool, jobs: Option<usize>) -> Result<()> {
+    use std::io::Write;
+
+    let cfg = victory_core::Config::load()?;
+    victory_hle::modules::d3d12x::init_shader_prewarm(cfg.cache_subdir("shaders")?);
+    let paths = crate::default_paths(paths)?;
+
+    let mut seen = HashSet::new();
+    let mut containers: Vec<Vec<u8>> = Vec::new();
+    for root in &paths {
+        for entry in walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+                continue;
+            }
+            let Ok(data) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            for src in sources(&data) {
+                let Some(bytes) = src.bytes() else {
+                    continue;
+                };
+                if bytes.len() < 0x20 || &bytes[0..4] != b"DXBC" {
+                    continue;
+                }
+                let size = u32::from_le_bytes([bytes[0x18], bytes[0x19], bytes[0x1a], bytes[0x1b]])
+                    as usize;
+                if size < 0x20 || size > bytes.len() {
+                    continue;
+                }
+                let slice = &bytes[..size];
+                if Container::parse(slice).is_err() {
+                    continue;
+                }
+                if seen.insert(blake3::hash(slice)) {
+                    containers.push(slice.to_vec());
+                }
+            }
+        }
+    }
+
+    let total = containers.len();
+    let threads = jobs
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
+        .max(1);
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let hits = AtomicUsize::new(0);
+    let translated = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(0);
+    let out_lock = Mutex::new(());
+
+    if progress {
+        println!("PREWARM 0 {total} 0 0 0");
+        let _ = std::io::stdout().flush();
+    }
+
+    let step = (total / 400).clamp(1, 50);
+    std::thread::scope(|s| {
+        for _ in 0..threads.min(total.max(1)) {
+            s.spawn(|| {
+                while let Some(c) = containers.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    match victory_hle::modules::d3d12x::prewarm_shader(c) {
+                        Ok(true) => {
+                            hits.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(false) => {
+                            translated.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(_) => {
+                            failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if progress && (d % step == 0 || d == total) {
+                        let _g = lock(&out_lock);
+                        println!(
+                            "PREWARM {d} {total} {} {} {}",
+                            hits.load(Ordering::Relaxed),
+                            translated.load(Ordering::Relaxed),
+                            failed.load(Ordering::Relaxed),
+                        );
+                        let _ = std::io::stdout().flush();
+                    }
+                }
+            });
+        }
+    });
+
+    if !progress {
+        println!(
+            "prewarm      {total} shaders ({} cached, {} translated, {} skipped)",
+            hits.load(Ordering::Relaxed),
+            translated.load(Ordering::Relaxed),
+            failed.load(Ordering::Relaxed),
+        );
+    }
+    Ok(())
+}

@@ -78,6 +78,12 @@ enum Command {
         /// Also create a host D3D12 pipeline for each emitted shader.
         #[arg(long)]
         pipelines: bool,
+        /// Write translated shaders into the runtime on-disk shader cache.
+        #[arg(long)]
+        cache: bool,
+        /// Emit machine-readable progress lines while pre-warming `--cache`.
+        #[arg(long)]
+        progress: bool,
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
@@ -150,9 +156,14 @@ fn main() -> Result<()> {
             paths,
             validate,
             pipelines,
+            cache,
+            progress,
             list,
             jobs,
         } => {
+            if cache {
+                return translate::prewarm(paths, progress, jobs);
+            }
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_view_heap_limit(n);

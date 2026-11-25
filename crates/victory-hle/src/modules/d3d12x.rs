@@ -49,6 +49,27 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     let _ = dir;
 }
 
+/// Initializes host GPU settings and opens `dir` for offline shader cache pre-warming.
+pub fn init_shader_prewarm(dir: std::path::PathBuf) {
+    #[cfg(windows)]
+    victory_gpu::shader_cache::init_for_prewarm(dir);
+    #[cfg(not(windows))]
+    let _ = dir;
+}
+
+/// Pre-translates one shader container into the on-disk shader cache.
+pub fn prewarm_shader(container: &[u8]) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        victory_gpu::shader_cache::prewarm(container)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = container;
+        Err("shader cache pre-warming is Windows-only".to_owned())
+    }
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "d3d12x",
